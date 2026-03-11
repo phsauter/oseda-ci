@@ -105,7 +105,6 @@ jobs:
           # Read the base-image label from the source image for the current platform
           # ubuntu:noble as the fallback
           BASE=$(docker buildx imagetools inspect \
-            --raw \
             "hpretl/iic-osic-tools:${{ needs.prepare.outputs.source_tag }}" \
             --format '{{ (index .Image.Config.Labels "org.opencontainers.image.base.name") }}' \
             2>/dev/null || true)

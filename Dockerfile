@@ -27,6 +27,7 @@
 # as they are not shared libraries and ldd cannot see them.
 
 ARG SOURCE_IMAGE=hpretl/iic-osic-tools:2025.12
+ARG BASE_IMAGE=ubuntu:noble
 FROM ${SOURCE_IMAGE} AS source
 
 # Derive the needed apt-managed packages
@@ -47,9 +48,10 @@ RUN find \
         -type f \( -executable -o -name "*.so*" \) \
     | xargs ldd 2>/dev/null \
     | awk '/=>/ { print $3 }' \
-    | grep -E '^/(usr/lib|lib)/' \
+    | grep '^/' \
     | sort -u \
     | xargs dpkg -S 2>/dev/null \
+    | grep -v '^diversion' \
     | cut -d: -f1 \
     | sort -u \
     > /tmp/apt-packages.txt
@@ -59,10 +61,9 @@ RUN find \
 # choose to install is pinned to exactly the version from this image.
 RUN pip3 freeze > /tmp/pip-constraints.txt
 
-# Base image: defaults to ubuntu:noble but can be overridden at build time.
+# Base image: overridden at build time via --build-arg BASE_IMAGE=...
 # In CI the base is read from the org.opencontainers.image.base.name label
 # of the source image so this image always tracks the same base as iic-osic-tools.
-ARG BASE_IMAGE=ubuntu:noble
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -72,6 +73,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TOOLS=/foss/tools \
     PDK_ROOT=/foss/pdks \
     DESIGNS=/foss/designs \
+    STARTUPDIR=/dockerstartup \
     # Disable the PEP 668 "externally managed environment" restriction.
     # In a container this guard is pointless.
     PIP_BREAK_SYSTEM_PACKAGES=1
@@ -82,27 +84,138 @@ COPY --from=source /tmp/pip-constraints.txt /tmp/
 RUN apt-get update \
     # Install the shared-library packages derived from the ldd scan.
     && xargs apt-get install -y --no-install-recommends < /tmp/apt-packages.txt \
-    # Install interpreters and tools that the EDA tools invoke at runtime.
-    # These are executables (not shared libraries) so ldd cannot find them.
+    # Runtime libraries: the complete set from the source image's base install.
+    # ldd only covers ELF-linked deps; dlopen/TCL-loaded libs must be listed explicitly.
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         locales \
         tzdata \
+        libasound2t64 \
+        libblas3 \
+        libboost-filesystem1.83.0 \
+        libboost-iostreams1.83.0 \
+        libboost-program-options1.83.0 \
+        libboost-python1.83.0 \
+        libboost-serialization1.83.0 \
+        libboost-system1.83.0 \
+        libboost-thread1.83.0 \
+        libbz2-1.0 \
+        libcairo2 \
+        libcurl4 \
+        libdw1 \
+        libedit2 \
+        libexpat1 \
+        libffi8 \
+        libfftw3-double3 \
+        libfftw3-long3 \
+        libfftw3-single3 \
+        libfindbin-libs-perl \
+        libfl2 \
+        libftdi1 \
+        libgcc-s1 \
+        libgettextpo0 \
+        libgirepository-1.0-1 \
+        libgit2-1.7 \
+        libglu1-mesa \
+        libgmp10 \
+        libgomp1 \
+        libgoogle-perftools4 \
+        libgtk-3-0 \
+        libgtk-4-1 \
+        libhdf5-103-1 \
+        libjpeg-turbo8 \
+        libjudydebian1 \
+        libklu2 \
+        liblapack3 \
+        liblzma5 \
+        libmng2 \
+        libmpc3 \
+        libmpfr6 \
+        libncurses6 \
+        libgnat-13 \
+        libnss-wrapper \
+        libomp5-17 \
+        libopenblas0 \
+        libopenblas0-pthread \
+        libopenmpi3 \
+        libpcre2-8-0 \
+        libpcre3 \
+        libpython3.12 \
+        libqhull-r8.0 \
+        libqt5charts5 \
+        libqt5multimedia5 \
+        libqt5multimediawidgets5 \
+        libqt5sql5t64 \
+        libqt5svg5 \
+        libqt5xml5t64 \
+        libqt5xmlpatterns5 \
+        libqt6charts6 \
+        libqt6core5compat6 \
+        libqt6core6t64 \
+        libqt6help6 \
+        libqt6multimedia6 \
+        libqt6svg6 \
+        libqt6svgwidgets6 \
+        libqt6uitools6 \
+        libre2-10 \
+        libreadline8 \
+        libsm6 \
+        libsqlite3-0 \
+        libssl3 \
+        libsuitesparse-mongoose3 \
+        libtcl8.6 \
+        libtinyxml2.6.2v5 \
+        libtomlplusplus3 \
+        libtool \
+        libvtk9.1t64 \
+        libvtk9.1t64-qt \
+        libwxgtk3.2-1 \
+        libx11-6 \
+        libx11-xcb1 \
+        libxaw7 \
+        libxcb1 \
+        libxext6 \
+        libxft2 \
+        libxml2 \
+        libxpm4 \
+        libxrender1 \
+        libxslt1.1 \
+        libyaml-0-2 \
+        libyaml-cpp0.8 \
+        libz3-4 \
+        libzip4 \
+        libzstd1 \
+    # Interpreters and executables invoked by EDA tools at runtime
+    && apt-get install -y --no-install-recommends \
         git \
         wget \
         curl \
         python3 \
         python3-pip \
         python3-venv \
+        python3-pyqt5 \
+        python3-pyqt6 \
+        python3-tk \
+        python-is-python3 \
         perl \
         ruby \
         ruby-irb \
         tcl \
+        tclsh \
         tcllib \
+        tcl-tclreadline \
+        tk \
+        binutils \
+        mold \
         gcc \
         g++ \
         make \
+        zlib1g-dev \
+        ccache \
         clang-format \
+        gawk \
+        zip \
+        unzip \
     && locale-gen en_US.UTF-8 \
     && rm -rf /var/lib/apt/lists/* /tmp/apt-packages.txt
 
@@ -121,6 +234,7 @@ COPY --from=source ${TOOLS}/verilator           ${TOOLS}/verilator/
 COPY --from=source ${TOOLS}/riscv-gnu-toolchain ${TOOLS}/riscv-gnu-toolchain/
 COPY --from=source ${TOOLS}/openroad            ${TOOLS}/openroad/
 COPY --from=source ${TOOLS}/klayout             ${TOOLS}/klayout/
+COPY --from=source ${TOOLS}/ghdl               ${TOOLS}/ghdl/
 
 # Unified bin directory with symlinks to all tools
 COPY --from=source ${TOOLS}/bin                 ${TOOLS}/bin/
@@ -137,6 +251,9 @@ COPY --from=source ${HOME}/.bashrc ${HOME}/.bashrc
 # tool version manifest
 COPY --from=source /tool_metadata.yml /tool_metadata.yml
 
+# Entry point script and its dependencies (generate_container_user.sh, set_user_permission.sh)
+COPY --from=source /dockerstartup /dockerstartup/
+
 # Default environment setup
 
 ENV RISCV=${TOOLS}/riscv-gnu-toolchain
@@ -150,7 +267,7 @@ ${TOOLS}/openroad/bin:\
 ${TOOLS}/klayout:\
 ${PATH}
 
-ENV LD_LIBRARY_PATH=${TOOLS}/klayout
+ENV LD_LIBRARY_PATH=${TOOLS}/klayout:${TOOLS}/ghdl/lib
 
 # Python paths:
 #   - pyosys: the Yosys Python API lives under the yosys share tree
