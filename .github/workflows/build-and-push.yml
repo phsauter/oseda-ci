@@ -1,0 +1,181 @@
+# Copyright 2026 ETH Zurich and University of Bologna.
+# Licensed under the Apache License, Version 2.0, see LICENSE for details.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Philippe Sauter <phsauter@iis.ee.ethz.ch>
+#
+#
+# Workflow to build a smaller CI-friendlier version of the iic-osic-tools image
+# aimed at digital workflows only (eg github.com/pulp-platform/croc/)
+#
+# Required repository configs on Github
+# - DOCKERHUB_USERNAME   Docker Hub username -> public
+# - DOCKERHUB_TOKEN      Docker Hub access token (rw) added as a secret
+#
+# The resulting image is pushed to:
+# - docker.io/<DOCKERHUB_USERNAME>/oseda-ci:<source_tag>
+# - docker.io/<DOCKERHUB_USERNAME>/oseda-ci:latest
+
+name: Build and push
+
+# Trigger options
+# Push to main:      rebuild the image (e.g. after Dockerfile edits)
+#                    using DEFAULT_SOURCE_TAG defined below.
+#
+# Tag push 20YY.MM:  rebuild using that tag as the source, producing
+#                    a matching versioned image on Docker Hub.
+#
+# workflow_dispatch: manual trigger; caller supplies the source tag.
+
+on:
+  push:
+    branches: [main]
+    tags: ['20[0-9][0-9].[0-9][0-9]']   # matches iic-osic-tools versioning
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: 'iic-osic-tools source tag to build from (e.g. YYYY.MM)'
+        required: true
+        default: '2025.12'
+
+env:
+  DEFAULT_SOURCE_TAG: '2025.12'
+
+jobs:
+
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      source_tag: ${{ steps.meta.outputs.source_tag }}
+      image:      ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Resolve source tag and image name
+        id: meta
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            # Tag push: use the git tag itself as the source version.
+            tag="$GITHUB_REF_NAME"
+          elif [[ -n "${{ inputs.source_tag }}" ]]; then
+            # Manual dispatch: use the caller-supplied tag.
+            tag="${{ inputs.source_tag }}"
+          else
+            # Branch push (e.g. Dockerfile tweak): fall back to default.
+            tag="$DEFAULT_SOURCE_TAG"
+          fi
+          echo "source_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "image=${{ vars.DOCKERHUB_USERNAME }}/oseda-ci" >> "$GITHUB_OUTPUT"
+
+  # Build each platform on a native runner
+  # - amd64 runs on the standard GitHub-hosted runner
+  # - arm64 runs on GitHub's native arm64 runner (ubuntu-24.04-arm)
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sanitise platform name
+        # 'linux/amd64' -> 'linux-amd64' (slashes are invalid in artifacts)
+        id: plat
+        run: echo "pair=$(echo '${{ matrix.platform }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Detect base image from source
+        id: base
+        run: |
+          # Read the base-image label from the source image for the current platform
+          # ubuntu:noble as the fallback
+          BASE=$(docker buildx imagetools inspect \
+            --raw \
+            "hpretl/iic-osic-tools:${{ needs.prepare.outputs.source_tag }}" \
+            --format '{{ (index .Image.Config.Labels "org.opencontainers.image.base.name") }}' \
+            2>/dev/null || true)
+          echo "image=${BASE:-ubuntu:noble}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          # Push without a tag for now; the image is only addressable by its content digest
+          push: true
+          outputs: >-
+            type=image,
+            name=${{ needs.prepare.outputs.image }},
+            push-by-digest=true,
+            name-canonical=true
+          build-args: |
+            SOURCE_IMAGE=hpretl/iic-osic-tools:${{ needs.prepare.outputs.source_tag }}
+            BASE_IMAGE=${{ steps.base.outputs.image }}
+          # Per-platform cache stored in the registry so it persists across runners and workflow runs
+          cache-from: type=registry,ref=${{ needs.prepare.outputs.image }}:cache-${{ steps.plat.outputs.pair }}
+          cache-to:   type=registry,ref=${{ needs.prepare.outputs.image }}:cache-${{ steps.plat.outputs.pair }},mode=max
+
+      - name: Record digest for manifest assembly
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ steps.plat.outputs.pair }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Assemble the multi-arch manifest from digests
+  merge:
+    name: Merge manifests
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all digest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true # flatten into a single directory
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            --tag ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.source_tag }} \
+            --tag ${{ needs.prepare.outputs.image }}:latest \
+            $(printf '${{ needs.prepare.outputs.image }}@sha256:%s ' *)
+
+      - name: Inspect final manifest
+        run: docker buildx imagetools inspect ${{ needs.prepare.outputs.image }}:latest
